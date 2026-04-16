@@ -294,12 +294,10 @@ func balanceAt(client *ethclient.Client, address string, timeoutSec int) (*big.I
 func checkBalance(data chan string, pool *rpcPool, timeoutSec int) {
         defer wg.Done()
 
-        // FIX #2: exponential backoff per goroutine
         const (
-                minBackoff = 200 * time.Millisecond
-                maxBackoff = 5 * time.Second
+                minBackoff = 500 * time.Millisecond
+                maxBackoff = 10 * time.Second
         )
-        var errStreak int
 
         for creds := range data {
                 parts := strings.SplitN(creds, ":", 2)
@@ -308,43 +306,46 @@ func checkBalance(data chan string, pool *rpcPool, timeoutSec int) {
                 }
                 addr := parts[1]
 
-                client, idx := pool.getClient()
-                balance, err := balanceAt(client, addr, timeoutSec)
-                if err != nil {
-                        // Jika ada server lain, langsung retry ke server berikutnya
-                        if len(pool.clients) > 1 {
+                // Retry loop — key yang sama dicoba terus sampai berhasil
+                attempt := 0
+                for {
+                        client, idx := pool.getClient()
+                        balance, err := balanceAt(client, addr, timeoutSec)
+
+                        // Jika error, coba server berikutnya dulu (bila ada)
+                        if err != nil && len(pool.clients) > 1 {
                                 balance, err = balanceAt(pool.nextClient(idx), addr, timeoutSec)
                         }
+
                         if err != nil {
-                                errStreak++
-                                // Backoff: 200ms, 400ms, 800ms, 1600ms, 3200ms, lalu cap 5000ms
-                                shift := errStreak
-                                if shift > 10 {
-                                        shift = 10
+                                attempt++
+                                // Backoff: 500ms, 1s, 2s, 4s, 8s, cap 10s
+                                shift := attempt
+                                if shift > 5 {
+                                        shift = 5
                                 }
                                 backoff := minBackoff * (1 << shift)
                                 if backoff > maxBackoff {
                                         backoff = maxBackoff
                                 }
-                                log.Printf("[ERROR] streak=%d backoff=%s: %v\n", errStreak, backoff, err)
+                                log.Printf("[RETRY] attempt=%d backoff=%s addr=%s err=%v\n", attempt, backoff, addr, err)
                                 time.Sleep(backoff)
-                                continue
+                                continue // ulangi key yang sama
                         }
-                }
 
-                // Berhasil — reset error streak
-                errStreak = 0
+                        // Berhasil
+                        if balance.Cmp(big.NewInt(0)) != 0 {
+                                found := creds + ":" + balance.String() + "\n"
+                                writeToFound(found, "found.txt")
+                                fmt.Printf("[FOUND] %s\n", found)
+                        }
 
-                if balance.Cmp(big.NewInt(0)) != 0 {
-                        found := creds + ":" + balance.String() + "\n"
-                        writeToFound(found, "found.txt")
-                        fmt.Printf("[FOUND] %s\n", found)
-                }
-
-                atomic.AddUint64(&counter, 1)
-                if !silent {
-                        fmt.Printf("Creds: %s Balance: %s Counter: %d\n",
-                                creds, balance.String(), atomic.LoadUint64(&counter))
+                        atomic.AddUint64(&counter, 1)
+                        if !silent {
+                                fmt.Printf("Creds: %s Balance: %s Counter: %d\n",
+                                        creds, balance.String(), atomic.LoadUint64(&counter))
+                        }
+                        break // lanjut ke key berikutnya
                 }
         }
 }
