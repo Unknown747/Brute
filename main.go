@@ -67,19 +67,59 @@ func parseConfig() *config {
         return &cfg
 }
 
-// Baca private key terakhir dari last_key.txt
-// Jika file tidak ada, mulai dari key default
+const defaultKey = "0000000000000000000000000000000000000000000000000000000000000001"
+
+// isValidHexKey memeriksa apakah string adalah hex 64 karakter yang valid
+func isValidHexKey(key string) bool {
+        if len(key) != 64 {
+                return false
+        }
+        for _, c := range key {
+                if !strings.ContainsRune(POSSIBLE, c) {
+                        return false
+                }
+        }
+        return true
+}
+
+// resetLastKey menghapus file lama, menulis ulang dengan default key, dan memberi tahu pengguna
+func resetLastKey(alasan string) string {
+        fmt.Printf("[PERINGATAN] last_key.txt %s\n", alasan)
+        fmt.Printf("[RESET] Memulai ulang dari key default: %s\n", defaultKey)
+        writeLastKey(defaultKey)
+        return defaultKey
+}
+
+// readLastKey membaca private key dari last_key.txt dengan validasi penuh
+// Jika file tidak ada, kosong, rusak, atau formatnya salah → reset otomatis ke default
 func readLastKey() string {
         data, err := os.ReadFile(LAST_KEY_FILE)
         if err != nil {
-                defaultKey := "0000000000000000000000000000000000000000000000000000000000000001"
+                // File tidak ditemukan
+                fmt.Printf("[INFO] last_key.txt tidak ditemukan. Membuat file baru.\n")
                 writeLastKey(defaultKey)
+                fmt.Printf("[INFO] Mulai dari key default: %s\n", defaultKey)
                 return defaultKey
         }
+
         key := strings.TrimSpace(string(data))
-        if len(key) != 64 {
-                log.Fatalf("last_key.txt berisi key tidak valid (harus 64 karakter hex)\n")
+
+        // File kosong
+        if key == "" {
+                return resetLastKey("kosong.")
         }
+
+        // Panjang tidak sesuai
+        if len(key) != 64 {
+                return resetLastKey(fmt.Sprintf("tidak valid: panjang %d karakter (harus 64).", len(key)))
+        }
+
+        // Karakter bukan hex
+        if !isValidHexKey(key) {
+                return resetLastKey("mengandung karakter yang bukan hex (0-9, a-f).")
+        }
+
+        fmt.Printf("[INFO] Melanjutkan dari key: %s\n", key)
         return key
 }
 
