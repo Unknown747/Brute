@@ -1,13 +1,16 @@
 package main
 
 import (
+        "bytes"
         "context"
         "crypto/ecdsa"
+        "encoding/json"
         "flag"
         "fmt"
         "log"
         "math/big"
         "math/rand"
+        "net/http"
         "os"
         "os/signal"
         "runtime"
@@ -60,6 +63,9 @@ var (
 
         lastKeyMu sync.Mutex
         lastKeyCh = make(chan string, 1)
+
+        foundMu sync.Mutex        // proteksi penulisan found.txt dari banyak goroutine
+        tgCfg   *telegramConfig   // config Telegram, nil jika tidak dikonfigurasi
 )
 
 func parseConfig() *config {
@@ -88,6 +94,56 @@ func primaryURL(cfg *config) string {
                 return fmt.Sprintf("http://%s:%d", cfg.server, cfg.port)
         }
         return DEFAULT_RPC
+}
+
+// ============================================================
+// TELEGRAM NOTIFICATION
+// ============================================================
+
+type telegramConfig struct {
+        BotToken string `json:"bot_token"`
+        ChatID   string `json:"chat_id"`
+}
+
+func loadTelegramConfig(path string) *telegramConfig {
+        data, err := os.ReadFile(path)
+        if err != nil {
+                // File tidak ada — Telegram dinonaktifkan
+                return nil
+        }
+        var cfg telegramConfig
+        if err := json.Unmarshal(data, &cfg); err != nil {
+                log.Printf("[TELEGRAM] Gagal baca %s: %v — notifikasi dinonaktifkan\n", path, err)
+                return nil
+        }
+        if cfg.BotToken == "" || cfg.ChatID == "" {
+                log.Printf("[TELEGRAM] bot_token atau chat_id kosong di %s — notifikasi dinonaktifkan\n", path)
+                return nil
+        }
+        log.Printf("[TELEGRAM] Notifikasi aktif → chat_id: %s\n", cfg.ChatID)
+        return &cfg
+}
+
+func sendTelegram(msg string) {
+        if tgCfg == nil {
+                return
+        }
+        go func() {
+                url := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", tgCfg.BotToken)
+                body, _ := json.Marshal(map[string]string{
+                        "chat_id": tgCfg.ChatID,
+                        "text":    msg,
+                })
+                resp, err := http.Post(url, "application/json", bytes.NewReader(body))
+                if err != nil {
+                        log.Printf("[TELEGRAM] Gagal kirim: %v\n", err)
+                        return
+                }
+                defer resp.Body.Close()
+                if resp.StatusCode != http.StatusOK {
+                        log.Printf("[TELEGRAM] Status tidak OK: %d\n", resp.StatusCode)
+                }
+        }()
 }
 
 // ============================================================
@@ -507,9 +563,10 @@ func checkBalance(ctx context.Context, data chan string, pool *rpcPool, timeoutS
                         ab.record(true)
                         for i, bal := range balances {
                                 if bal != nil && bal.Cmp(big.NewInt(0)) != 0 {
-                                        found := batch[i] + ":" + bal.String() + "\n"
-                                        writeToFound(found, "found.txt")
+                                        found := batch[i] + ":" + bal.String()
+                                        writeToFound(found+"\n", "found.txt")
                                         fmt.Printf("[FOUND] %s\n", found)
+                                        sendTelegram(fmt.Sprintf("🎉 [FOUND]\n%s", found))
                                 }
                         }
                         n := uint64(len(batch))
@@ -559,6 +616,8 @@ func checkBalance(ctx context.Context, data chan string, pool *rpcPool, timeoutS
 // ============================================================
 
 func writeToFound(text string, path string) {
+        foundMu.Lock()
+        defer foundMu.Unlock()
         f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0655)
         if err != nil {
                 log.Fatalf("Open file: %s %v\n", text, err)
@@ -627,6 +686,8 @@ func main() {
         if silent {
                 fmt.Println("[SILENT] Mode diam aktif — hanya tampil [STATS] dan [FOUND]")
         }
+
+        tgCfg = loadTelegramConfig("telegram.json")
 
         primary := primaryURL(cfg)
         var backupURLs []string
