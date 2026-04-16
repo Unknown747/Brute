@@ -47,6 +47,10 @@ var (
 		fmt.Fprintf(os.Stderr, "Usage of %s:\n", os.Args[0])
 		flag.PrintDefaults()
 	}
+
+	// PERBAIKAN #5: Satu instance rand global dengan mutex agar aman untuk concurrency
+	randMu  sync.Mutex
+	globalR = rand.New(rand.NewSource(time.Now().UnixNano()))
 )
 
 func parseConfig() *config {
@@ -78,7 +82,6 @@ func SHA256(hasher hash.Hash, input []byte) (hash []byte) {
 	hasher.Write(input)
 	hash = hasher.Sum(nil)
 	return hash
-
 }
 
 func NewPrivateKey(password string) string {
@@ -103,16 +106,16 @@ func generateNextPrivKey(hex string) string {
 	return strings.Join(sh, "")
 }
 
+// PERBAIKAN #5: Menggunakan globalR dengan mutex, tidak membuat rand baru setiap panggilan
 func generateRandomPrivKey() string {
-	r := rand.New(rand.NewSource(time.Now().UnixNano()))
+	randMu.Lock()
+	defer randMu.Unlock()
 
 	var randHex string
-
 	for c := 0; c < 64; c++ {
-		n := r.Intn(16)
+		n := globalR.Intn(16)
 		randHex += string(POSSIBLE[n])
 	}
-
 	return randHex
 }
 
@@ -128,7 +131,12 @@ func balanceAt(client *ethclient.Client, address string) (*big.Int, error) {
 	return balance, nil
 }
 
+// PERBAIKAN #1 & #3: Gunakan range agar goroutine berhenti saat channel ditutup
+// Tambah backoff 500ms saat error agar tidak spam ke server
 func checkBrainBalance(passwords chan string, client *ethclient.Client) {
+	// PERBAIKAN #2: defer wg.Done() di awal fungsi, bukan di dalam loop
+	defer wg.Done()
+
 	for password := range passwords {
 		privKey := NewPrivateKey(password)
 		address := generateAddressFromPrivKey(privKey)
@@ -138,6 +146,7 @@ func checkBrainBalance(passwords chan string, client *ethclient.Client) {
 
 		if err != nil {
 			log.Printf("Check balance: %s %v\n", creds, err)
+			time.Sleep(500 * time.Millisecond)
 			continue
 		}
 
@@ -148,7 +157,6 @@ func checkBrainBalance(passwords chan string, client *ethclient.Client) {
 		atomic.AddUint64(&counter, 1)
 		fmt.Printf("Creds: %s Balance: %s Counter: %d\n", password+":"+creds, balance.String(), atomic.LoadUint64(&counter))
 	}
-	defer wg.Done()
 }
 
 func generateAddressFromPrivKey(hex string) string {
@@ -182,9 +190,12 @@ http://165.227.16.243:8545
 202.61.239.89:8545 NEW!
 */
 
+// PERBAIKAN #1 & #3: Gunakan range agar goroutine berhenti saat channel ditutup
+// Tambah backoff 500ms saat error
 func checkBalance(data chan string, client *ethclient.Client) {
-	for {
-		creds := <-data
+	defer wg.Done()
+
+	for creds := range data {
 		addr := strings.Split(creds, ":")[1]
 
 		balance, err := balanceAt(client, addr)
@@ -194,12 +205,13 @@ func checkBalance(data chan string, client *ethclient.Client) {
 				log.Fatalf("Check balance: %s %v\n", creds, err)
 			}
 			log.Printf("Check balance: %s %v\n", creds, err)
+			time.Sleep(500 * time.Millisecond)
 			continue
 		}
 
 		if balance.Cmp(big.NewInt(0)) != 0 {
-			data := creds + ":" + balance.String() + "\n"
-			writeToFound(data, "found.txt")
+			found := creds + ":" + balance.String() + "\n"
+			writeToFound(found, "found.txt")
 		}
 		atomic.AddUint64(&counter, 1)
 		fmt.Printf("Creds: %s Balance: %s Counter: %d\n", creds, balance.String(), atomic.LoadUint64(&counter))
@@ -232,8 +244,9 @@ func main() {
 	}
 	defer client.Close()
 
-	chData := make(chan string)
-	chExit := make(chan os.Signal)
+	// PERBAIKAN #4: Buffered channel sebesar 2x jumlah threads
+	chData := make(chan string, cfg.threads*2)
+	chExit := make(chan os.Signal, 1)
 
 	signal.Notify(chExit, os.Interrupt, syscall.SIGTERM)
 
@@ -245,6 +258,7 @@ func main() {
 
 	if cfg.random {
 		for t := 0; t < cfg.threads; t++ {
+			wg.Add(1)
 			go checkBalance(chData, client)
 		}
 
@@ -259,6 +273,7 @@ func main() {
 		}
 
 		for t := 0; t < cfg.threads; t++ {
+			wg.Add(1)
 			go checkBalance(chData, client)
 		}
 
