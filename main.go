@@ -33,8 +33,9 @@ type config struct {
 }
 
 const (
-        POSSIBLE    = "0123456789abcdef"
-        LAST_KEY_FILE = "last_key.txt"
+        POSSIBLE       = "0123456789abcdef"
+        LAST_KEY_FILE  = "last_key.txt"
+        BACKUP_KEY_FILE = "last_key.bak"
 )
 
 var (
@@ -131,6 +132,39 @@ func writeLastKey(key string) {
         if err != nil {
                 log.Printf("Gagal menyimpan last_key.txt: %v\n", err)
         }
+}
+
+// backupLastKey menyalin isi last_key.txt ke last_key.bak
+func backupLastKey() {
+        lastKeyMu.Lock()
+        data, err := os.ReadFile(LAST_KEY_FILE)
+        lastKeyMu.Unlock()
+
+        if err != nil {
+                log.Printf("Backup: gagal baca %s: %v\n", LAST_KEY_FILE, err)
+                return
+        }
+
+        err = os.WriteFile(BACKUP_KEY_FILE, data, 0644)
+        if err != nil {
+                log.Printf("Backup: gagal tulis %s: %v\n", BACKUP_KEY_FILE, err)
+                return
+        }
+
+        key := strings.TrimSpace(string(data))
+        fmt.Printf("[BACKUP] last_key.bak diperbarui → %s\n", key)
+}
+
+// startBackupRoutine menjalankan backup last_key.txt setiap intervalMenit menit
+func startBackupRoutine(intervalMenit int) {
+        ticker := time.NewTicker(time.Duration(intervalMenit) * time.Minute)
+        fmt.Printf("[BACKUP] Backup otomatis aktif setiap %d menit ke last_key.bak\n", intervalMenit)
+
+        go func() {
+                for range ticker.C {
+                        backupLastKey()
+                }
+        }()
 }
 
 func generateNextPrivKey(privHex string) string {
@@ -307,6 +341,11 @@ func main() {
         }()
 
         startSpeedStats(60)
+
+        if cfg.mode2 {
+                // Backup last_key.txt setiap 5 menit, hanya aktif di mode berurutan
+                startBackupRoutine(5)
+        }
 
         if cfg.mode1 {
                 // Mode random
