@@ -231,10 +231,25 @@ func writeToFound(text string, path string) {
         }
 }
 
-// startSpeedStats mencetak stats kecepatan setiap interval detik
+// writeStatsLog menulis baris stats ke file stats.log
+func writeStatsLog(line string) {
+        f, err := os.OpenFile("stats.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+        if err != nil {
+                log.Printf("Stats log: %v\n", err)
+                return
+        }
+        defer f.Close()
+        f.WriteString(line + "\n")
+}
+
+// startSpeedStats mencetak stats kecepatan setiap interval detik dan menyimpan ke stats.log
 func startSpeedStats(intervalSec int) {
         ticker := time.NewTicker(time.Duration(intervalSec) * time.Second)
         var lastCount uint64 = 0
+
+        // Tulis header sesi baru ke stats.log
+        sessionStart := fmt.Sprintf("\n=== Sesi dimulai: %s ===", startTime.Format("2006-01-02 15:04:05"))
+        writeStatsLog(sessionStart)
 
         go func() {
                 for range ticker.C {
@@ -243,8 +258,12 @@ func startSpeedStats(intervalSec int) {
                         keysPerSec := float64(current-lastCount) / float64(intervalSec)
                         avgPerSec := float64(current) / elapsed.Seconds()
 
-                        fmt.Printf("\n[STATS] Elapsed: %s | Total: %d | Speed: %.1f keys/s | Avg: %.1f keys/s\n\n",
+                        line := fmt.Sprintf("[%s] Elapsed: %s | Total: %d | Speed: %.1f keys/s | Avg: %.1f keys/s",
+                                time.Now().Format("15:04:05"),
                                 elapsed.Round(time.Second), current, keysPerSec, avgPerSec)
+
+                        fmt.Printf("\n[STATS] %s\n\n", line)
+                        writeStatsLog(line)
 
                         lastCount = current
                 }
@@ -255,8 +274,12 @@ func cleanup() {
         elapsed := time.Since(startTime)
         total := atomic.LoadUint64(&counter)
         avgPerSec := float64(total) / elapsed.Seconds()
-        fmt.Printf("\n[SELESAI] Total: %d alamat | Waktu: %s | Rata-rata: %.1f keys/s\n",
+
+        line := fmt.Sprintf("[SELESAI] Total: %d alamat | Waktu: %s | Rata-rata: %.1f keys/s",
                 total, elapsed.Round(time.Second), avgPerSec)
+
+        fmt.Printf("\n%s\n", line)
+        writeStatsLog(line)
 }
 
 func main() {
