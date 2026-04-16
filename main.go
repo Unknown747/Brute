@@ -78,8 +78,9 @@ func parseConfig() *config {
 // ============================================================
 
 type rpcPool struct {
-        clients []clientEntry
-        current uint64
+        clients   []clientEntry
+        current   uint64 // digunakan untuk failover watchPrimary
+        rrCounter uint64 // digunakan untuk round-robin (auto increment per request)
 }
 
 type clientEntry struct {
@@ -117,21 +118,19 @@ func newRPCPool(primaryURL string, backupURLs []string) (*rpcPool, error) {
         return pool, nil
 }
 
-// getClient mengembalikan client aktif beserta indeksnya
+// getClient round-robin otomatis: setiap request ke server berbeda secara bergilir
 func (p *rpcPool) getClient() (*ethclient.Client, uint64) {
-        idx := atomic.LoadUint64(&p.current) % uint64(len(p.clients))
+        idx := atomic.AddUint64(&p.rrCounter, 1) % uint64(len(p.clients))
         return p.clients[idx].client, idx
 }
 
-// rotate pindah ke server berikutnya saat error
-func (p *rpcPool) rotate(failedIdx uint64) {
+// nextClient ambil server berikutnya setelah error (skip server yang gagal)
+func (p *rpcPool) nextClient(failedIdx uint64) (*ethclient.Client, uint64) {
         if len(p.clients) <= 1 {
-                return
+                return p.clients[0].client, 0
         }
-        next := (failedIdx + 1) % uint64(len(p.clients))
-        if atomic.CompareAndSwapUint64(&p.current, failedIdx, next) {
-                fmt.Printf("\n[RPC] Pindah ke server: %s\n", p.clients[next].url)
-        }
+        idx := (failedIdx + 1) % uint64(len(p.clients))
+        return p.clients[idx].client, idx
 }
 
 // watchPrimary mencoba kembali ke server utama setiap 30 detik
@@ -308,10 +307,16 @@ func checkBalance(data chan string, pool *rpcPool, timeoutSec int) {
                 client, idx := pool.getClient()
                 balance, err := balanceAt(client, addr, timeoutSec)
                 if err != nil {
-                        log.Printf("[ERROR] %s: %v\n", pool.clients[idx].url, err)
-                        pool.rotate(idx)
-                        time.Sleep(200 * time.Millisecond)
-                        continue
+                        // Langsung coba server berikutnya tanpa sleep jika ada alternatif
+                        if len(pool.clients) > 1 {
+                                client2, _ := pool.nextClient(idx)
+                                balance, err = balanceAt(client2, addr, timeoutSec)
+                        }
+                        if err != nil {
+                                log.Printf("[ERROR] %s: %v\n", pool.clients[idx].url, err)
+                                time.Sleep(200 * time.Millisecond)
+                                continue
+                        }
                 }
 
                 if balance.Cmp(big.NewInt(0)) != 0 {
