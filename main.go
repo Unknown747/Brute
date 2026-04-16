@@ -355,7 +355,7 @@ func balanceAt(client *ethclient.Client, address string, timeoutSec int) (*big.I
         return balance, nil
 }
 
-func checkBalance(data chan string, pool *rpcPool, timeoutSec int) {
+func checkBalance(ctx context.Context, data chan string, pool *rpcPool, timeoutSec int) {
         defer wg.Done()
 
         const (
@@ -370,9 +370,16 @@ func checkBalance(data chan string, pool *rpcPool, timeoutSec int) {
                 }
                 addr := parts[1]
 
-                // Retry loop — key yang sama dicoba terus sampai berhasil
+                // Retry loop — key yang sama dicoba terus sampai berhasil atau shutdown
                 attempt := 0
                 for {
+                        // Cek apakah shutdown diminta sebelum setiap percobaan
+                        select {
+                        case <-ctx.Done():
+                                return
+                        default:
+                        }
+
                         client, idx := pool.getClient()
                         balance, err := balanceAt(client, addr, timeoutSec)
 
@@ -397,7 +404,12 @@ func checkBalance(data chan string, pool *rpcPool, timeoutSec int) {
                                         backoff = maxBackoff
                                 }
                                 log.Printf("[RETRY] attempt=%d backoff=%s addr=%s err=%v\n", attempt, backoff, addr, err)
-                                time.Sleep(backoff)
+                                // Tunggu backoff atau shutdown — mana yang lebih dulu
+                                select {
+                                case <-time.After(backoff):
+                                case <-ctx.Done():
+                                        return
+                                }
                                 continue // ulangi key yang sama
                         }
 
@@ -508,12 +520,17 @@ func main() {
 
         startTime = time.Now()
         chData := make(chan string, cfg.threads*2)
+
+        // Graceful shutdown: cancel context saat sinyal diterima
+        ctx, cancel := context.WithCancel(context.Background())
+        defer cancel()
+
         chExit := make(chan os.Signal, 1)
         signal.Notify(chExit, os.Interrupt, syscall.SIGTERM)
         go func() {
                 <-chExit
-                cleanup()
-                os.Exit(0)
+                fmt.Println("\n[SHUTDOWN] Sinyal diterima — menyelesaikan key yang sedang diproses...")
+                cancel() // hentikan semua goroutine dengan bersih
         }()
 
         startSpeedStats(60)
@@ -523,27 +540,43 @@ func main() {
                         cfg.threads, cfg.timeout, len(pool.clients))
                 for t := 0; t < cfg.threads; t++ {
                         wg.Add(1)
-                        go checkBalance(chData, pool, cfg.timeout)
+                        go checkBalance(ctx, chData, pool, cfg.timeout)
                 }
+        outer1:
                 for {
                         pk := generateRandomPrivKey()
-                        chData <- pk + ":" + generateAddressFromPrivKey(pk)
+                        select {
+                        case chData <- pk + ":" + generateAddressFromPrivKey(pk):
+                        case <-ctx.Done():
+                                break outer1
+                        }
                 }
 
         } else {
-                startKeyWriter() // FIX #1: satu goroutine permanen untuk tulis last_key.txt
+                startKeyWriter()
                 startBackupRoutine(5)
                 pk := readLastKey()
                 fmt.Printf("[MODE2] Berurutan | Mulai: %s | Threads: %d | Timeout: %ds | Server: %d\n",
                         pk, cfg.threads, cfg.timeout, len(pool.clients))
                 for t := 0; t < cfg.threads; t++ {
                         wg.Add(1)
-                        go checkBalance(chData, pool, cfg.timeout)
+                        go checkBalance(ctx, chData, pool, cfg.timeout)
                 }
+        outer2:
                 for {
                         pk = generateNextPrivKey(pk)
-                        chData <- pk + ":" + generateAddressFromPrivKey(pk)
-                        sendLastKey(pk) // tidak spawn goroutine baru setiap iterasi
+                        select {
+                        case chData <- pk + ":" + generateAddressFromPrivKey(pk):
+                                sendLastKey(pk)
+                        case <-ctx.Done():
+                                break outer2
+                        }
                 }
         }
+
+        // Tunggu semua goroutine selesai memproses key yang sedang berjalan
+        close(chData)
+        wg.Wait()
+        cleanup()
+        fmt.Println("[SHUTDOWN] Selesai. Semua proses telah dihentikan dengan aman.")
 }
