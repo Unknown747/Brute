@@ -26,4 +26,4 @@ outputType = "console"
 
 [[workflows.workflow.tasks]]
 task = "shell.exec"
-args = "go run . -mode1 -silent -batch 20 -threads 8 -timeout 10"
+args = "go run . -mode1 -silent -batch 5 -threads 2 -producers 2 -timeout 15"
