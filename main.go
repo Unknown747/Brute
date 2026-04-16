@@ -282,8 +282,8 @@ func main() {
                 os.Exit(0)
         }()
 
-        // Tampilkan stats kecepatan setiap 5 detik
-        startSpeedStats(5)
+        // Tampilkan stats kecepatan setiap 1 menit
+        startSpeedStats(60)
 
         if cfg.random {
                 for t := 0; t < cfg.threads; t++ {
