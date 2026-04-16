@@ -1,178 +1,178 @@
 package main
 
 import (
-	"context"
-	"crypto/ecdsa"
-	"crypto/sha256"
-	"encoding/hex"
-	"flag"
-	"fmt"
-	"hash"
-	"io"
-	"log"
-	"math/big"
-	"math/rand"
-	"os"
-	"os/signal"
-	"runtime"
-	"strconv"
-	"strings"
-	"sync"
-	"sync/atomic"
-	"syscall"
-	"time"
+        "context"
+        "crypto/ecdsa"
+        "crypto/sha256"
+        "encoding/hex"
+        "flag"
+        "fmt"
+        "hash"
+        "io"
+        "log"
+        "math/big"
+        "math/rand"
+        "os"
+        "os/signal"
+        "runtime"
+        "strconv"
+        "strings"
+        "sync"
+        "sync/atomic"
+        "syscall"
+        "time"
 
-	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/crypto"
-	"github.com/ethereum/go-ethereum/ethclient"
+        "github.com/ethereum/go-ethereum/common"
+        "github.com/ethereum/go-ethereum/crypto"
+        "github.com/ethereum/go-ethereum/ethclient"
 )
 
 type config struct {
-	privKey string
-	threads int
-	random  bool
-	server  string
-	port    int
-	brain   string
+        privKey string
+        threads int
+        random  bool
+        server  string
+        port    int
+        brain   string
 }
 
 const (
-	POSSIBLE = "0123456789abcdef"
+        POSSIBLE = "0123456789abcdef"
 )
 
 var (
-	counter uint64 = 0
-	wg      sync.WaitGroup
-	usage   = func() {
-		fmt.Fprintf(os.Stderr, "Usage of %s:\n", os.Args[0])
-		flag.PrintDefaults()
-	}
+        counter   uint64 = 0
+        startTime time.Time
+        wg        sync.WaitGroup
+        usage     = func() {
+                fmt.Fprintf(os.Stderr, "Usage of %s:\n", os.Args[0])
+                flag.PrintDefaults()
+        }
 
-	// PERBAIKAN #5: Satu instance rand global dengan mutex agar aman untuk concurrency
-	randMu  sync.Mutex
-	globalR = rand.New(rand.NewSource(time.Now().UnixNano()))
+        randMu  sync.Mutex
+        globalR = rand.New(rand.NewSource(time.Now().UnixNano()))
 )
 
 func parseConfig() *config {
-	var cfg config
+        var cfg config
 
-	flag.StringVar(&cfg.privKey, "pk", "", "Start private key")
-	flag.IntVar(&cfg.threads, "threads", runtime.NumCPU(), "Number of threads")
-	flag.BoolVar(&cfg.random, "random", false, "Generate random private key")
-	flag.StringVar(&cfg.server, "server", "202.61.239.89", "Ethereum rpc server")
-	flag.IntVar(&cfg.port, "port", 8545, "Ethereum rpc port")
-	flag.StringVar(&cfg.brain, "brain", "", "Password list")
-	flag.Parse()
+        flag.StringVar(&cfg.privKey, "pk", "", "Start private key")
+        flag.IntVar(&cfg.threads, "threads", runtime.NumCPU(), "Number of threads")
+        flag.BoolVar(&cfg.random, "random", false, "Generate random private key")
+        flag.StringVar(&cfg.server, "server", "202.61.239.89", "Ethereum rpc server")
+        flag.IntVar(&cfg.port, "port", 8545, "Ethereum rpc port")
+        flag.StringVar(&cfg.brain, "brain", "", "Password list")
+        flag.Parse()
 
-	return &cfg
+        return &cfg
 }
 
 func getPasswordList(path string) ([]string, error) {
-	f, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
+        f, err := os.ReadFile(path)
+        if err != nil {
+                return nil, err
+        }
 
-	passwords := strings.Split(string(f), "\n")
-	return passwords, nil
+        passwords := strings.Split(string(f), "\n")
+        return passwords, nil
 }
 
 func SHA256(hasher hash.Hash, input []byte) (hash []byte) {
-	hasher.Reset()
-	hasher.Write(input)
-	hash = hasher.Sum(nil)
-	return hash
+        hasher.Reset()
+        hasher.Write(input)
+        hash = hasher.Sum(nil)
+        return hash
 }
 
 func NewPrivateKey(password string) string {
-	hasher := sha256.New()
-	sha := SHA256(hasher, []byte(password))
-	priv := hex.EncodeToString(sha)
-	return priv
+        hasher := sha256.New()
+        sha := SHA256(hasher, []byte(password))
+        priv := hex.EncodeToString(sha)
+        return priv
 }
 
 func generateNextPrivKey(hex string) string {
-	sh := strings.Split(hex, "")
+        sh := strings.Split(hex, "")
 
-	for i := len(hex) - 1; i >= 0; i-- {
-		point := strings.Index(POSSIBLE, sh[i])
-		if point == 15 {
-			sh[i] = "0"
-		} else {
-			sh[i] = string(POSSIBLE[point+1])
-			break
-		}
-	}
-	return strings.Join(sh, "")
+        for i := len(hex) - 1; i >= 0; i-- {
+                point := strings.Index(POSSIBLE, sh[i])
+                if point == 15 {
+                        sh[i] = "0"
+                } else {
+                        sh[i] = string(POSSIBLE[point+1])
+                        break
+                }
+        }
+        return strings.Join(sh, "")
 }
 
 // PERBAIKAN #5: Menggunakan globalR dengan mutex, tidak membuat rand baru setiap panggilan
 func generateRandomPrivKey() string {
-	randMu.Lock()
-	defer randMu.Unlock()
+        randMu.Lock()
+        defer randMu.Unlock()
 
-	var randHex string
-	for c := 0; c < 64; c++ {
-		n := globalR.Intn(16)
-		randHex += string(POSSIBLE[n])
-	}
-	return randHex
+        var randHex string
+        for c := 0; c < 64; c++ {
+                n := globalR.Intn(16)
+                randHex += string(POSSIBLE[n])
+        }
+        return randHex
 }
 
 func balanceAt(client *ethclient.Client, address string) (*big.Int, error) {
-	account := common.HexToAddress(address)
-	balance, err := client.BalanceAt(context.Background(), account, nil)
-	if err != nil {
-		if err == io.EOF {
-			log.Fatalf("Check balance: %s %v\n", address, err)
-		}
-		return nil, err
-	}
-	return balance, nil
+        account := common.HexToAddress(address)
+        balance, err := client.BalanceAt(context.Background(), account, nil)
+        if err != nil {
+                if err == io.EOF {
+                        log.Fatalf("Check balance: %s %v\n", address, err)
+                }
+                return nil, err
+        }
+        return balance, nil
 }
 
 // PERBAIKAN #1 & #3: Gunakan range agar goroutine berhenti saat channel ditutup
 // Tambah backoff 500ms saat error agar tidak spam ke server
 func checkBrainBalance(passwords chan string, client *ethclient.Client) {
-	// PERBAIKAN #2: defer wg.Done() di awal fungsi, bukan di dalam loop
-	defer wg.Done()
+        // PERBAIKAN #2: defer wg.Done() di awal fungsi, bukan di dalam loop
+        defer wg.Done()
 
-	for password := range passwords {
-		privKey := NewPrivateKey(password)
-		address := generateAddressFromPrivKey(privKey)
-		creds := fmt.Sprintf("%s:%s", privKey, address)
+        for password := range passwords {
+                privKey := NewPrivateKey(password)
+                address := generateAddressFromPrivKey(privKey)
+                creds := fmt.Sprintf("%s:%s", privKey, address)
 
-		balance, err := balanceAt(client, address)
+                balance, err := balanceAt(client, address)
 
-		if err != nil {
-			log.Printf("Check balance: %s %v\n", creds, err)
-			time.Sleep(500 * time.Millisecond)
-			continue
-		}
+                if err != nil {
+                        log.Printf("Check balance: %s %v\n", creds, err)
+                        time.Sleep(500 * time.Millisecond)
+                        continue
+                }
 
-		if balance.Cmp(big.NewInt(0)) != 0 {
-			data := password + ":" + creds + ":" + balance.String() + "\n"
-			writeToFound(data, "found.txt")
-		}
-		atomic.AddUint64(&counter, 1)
-		fmt.Printf("Creds: %s Balance: %s Counter: %d\n", password+":"+creds, balance.String(), atomic.LoadUint64(&counter))
-	}
+                if balance.Cmp(big.NewInt(0)) != 0 {
+                        data := password + ":" + creds + ":" + balance.String() + "\n"
+                        writeToFound(data, "found.txt")
+                }
+                atomic.AddUint64(&counter, 1)
+                fmt.Printf("Creds: %s Balance: %s Counter: %d\n", password+":"+creds, balance.String(), atomic.LoadUint64(&counter))
+        }
 }
 
 func generateAddressFromPrivKey(hex string) string {
-	privateKey, err := crypto.HexToECDSA(hex)
-	if err != nil {
-		log.Fatal(err)
-	}
+        privateKey, err := crypto.HexToECDSA(hex)
+        if err != nil {
+                log.Fatal(err)
+        }
 
-	publicKey := privateKey.Public()
-	publicKeyECDSA, ok := publicKey.(*ecdsa.PublicKey)
-	if !ok {
-		log.Fatal("cannot assert type: publicKey is not of type *ecdsa.PublicKey")
-	}
+        publicKey := privateKey.Public()
+        publicKeyECDSA, ok := publicKey.(*ecdsa.PublicKey)
+        if !ok {
+                log.Fatal("cannot assert type: publicKey is not of type *ecdsa.PublicKey")
+        }
 
-	address := crypto.PubkeyToAddress(*publicKeyECDSA).Hex()
-	return address
+        address := crypto.PubkeyToAddress(*publicKeyECDSA).Hex()
+        return address
 }
 
 /*
@@ -193,113 +193,142 @@ http://165.227.16.243:8545
 // PERBAIKAN #1 & #3: Gunakan range agar goroutine berhenti saat channel ditutup
 // Tambah backoff 500ms saat error
 func checkBalance(data chan string, client *ethclient.Client) {
-	defer wg.Done()
+        defer wg.Done()
 
-	for creds := range data {
-		addr := strings.Split(creds, ":")[1]
+        for creds := range data {
+                addr := strings.Split(creds, ":")[1]
 
-		balance, err := balanceAt(client, addr)
+                balance, err := balanceAt(client, addr)
 
-		if err != nil {
-			if err == io.EOF {
-				log.Fatalf("Check balance: %s %v\n", creds, err)
-			}
-			log.Printf("Check balance: %s %v\n", creds, err)
-			time.Sleep(500 * time.Millisecond)
-			continue
-		}
+                if err != nil {
+                        if err == io.EOF {
+                                log.Fatalf("Check balance: %s %v\n", creds, err)
+                        }
+                        log.Printf("Check balance: %s %v\n", creds, err)
+                        time.Sleep(500 * time.Millisecond)
+                        continue
+                }
 
-		if balance.Cmp(big.NewInt(0)) != 0 {
-			found := creds + ":" + balance.String() + "\n"
-			writeToFound(found, "found.txt")
-		}
-		atomic.AddUint64(&counter, 1)
-		fmt.Printf("Creds: %s Balance: %s Counter: %d\n", creds, balance.String(), atomic.LoadUint64(&counter))
-	}
+                if balance.Cmp(big.NewInt(0)) != 0 {
+                        found := creds + ":" + balance.String() + "\n"
+                        writeToFound(found, "found.txt")
+                }
+                atomic.AddUint64(&counter, 1)
+                fmt.Printf("Creds: %s Balance: %s Counter: %d\n", creds, balance.String(), atomic.LoadUint64(&counter))
+        }
 }
 
 func writeToFound(text string, path string) {
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0655)
-	if err != nil {
-		log.Fatalf("Open file: %s %v\n", text, err)
-	}
-	defer f.Close()
+        f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0655)
+        if err != nil {
+                log.Fatalf("Open file: %s %v\n", text, err)
+        }
+        defer f.Close()
 
-	_, err = f.WriteString(text)
-	if err != nil {
-		log.Fatalf("Write string: %s %v\n", text, err)
-	}
+        _, err = f.WriteString(text)
+        if err != nil {
+                log.Fatalf("Write string: %s %v\n", text, err)
+        }
+}
+
+// startSpeedStats mencetak stats kecepatan setiap interval detik
+func startSpeedStats(intervalSec int) {
+        ticker := time.NewTicker(time.Duration(intervalSec) * time.Second)
+        var lastCount uint64 = 0
+
+        go func() {
+                for range ticker.C {
+                        current := atomic.LoadUint64(&counter)
+                        elapsed := time.Since(startTime)
+                        keysPerSec := float64(current-lastCount) / float64(intervalSec)
+                        avgPerSec := float64(current) / elapsed.Seconds()
+
+                        fmt.Printf("\n[STATS] Elapsed: %s | Total: %d | Speed: %.1f keys/s | Avg: %.1f keys/s\n\n",
+                                elapsed.Round(time.Second), current, keysPerSec, avgPerSec)
+
+                        lastCount = current
+                }
+        }()
 }
 
 func cleanup() {
-	fmt.Println("Total addresses:", atomic.LoadUint64(&counter))
+        elapsed := time.Since(startTime)
+        total := atomic.LoadUint64(&counter)
+        avgPerSec := float64(total) / elapsed.Seconds()
+        fmt.Printf("\n[SELESAI] Total: %d alamat | Waktu: %s | Rata-rata: %.1f keys/s\n",
+                total, elapsed.Round(time.Second), avgPerSec)
 }
 
 func main() {
-	cfg := parseConfig()
+        cfg := parseConfig()
 
-	client, err := ethclient.Dial("http://" + cfg.server + ":" + strconv.Itoa(cfg.port))
-	if err != nil {
-		log.Fatalf("Client: %s\n", err)
-	}
-	defer client.Close()
+        client, err := ethclient.Dial("http://" + cfg.server + ":" + strconv.Itoa(cfg.port))
+        if err != nil {
+                log.Fatalf("Client: %s\n", err)
+        }
+        defer client.Close()
 
-	// PERBAIKAN #4: Buffered channel sebesar 2x jumlah threads
-	chData := make(chan string, cfg.threads*2)
-	chExit := make(chan os.Signal, 1)
+        startTime = time.Now()
 
-	signal.Notify(chExit, os.Interrupt, syscall.SIGTERM)
+        // Buffered channel sebesar 2x jumlah threads
+        chData := make(chan string, cfg.threads*2)
+        chExit := make(chan os.Signal, 1)
 
-	go func() {
-		<-chExit
-		cleanup()
-		os.Exit(0)
-	}()
+        signal.Notify(chExit, os.Interrupt, syscall.SIGTERM)
 
-	if cfg.random {
-		for t := 0; t < cfg.threads; t++ {
-			wg.Add(1)
-			go checkBalance(chData, client)
-		}
+        go func() {
+                <-chExit
+                cleanup()
+                os.Exit(0)
+        }()
 
-		for {
-			pk := generateRandomPrivKey()
-			addr := generateAddressFromPrivKey(pk)
-			chData <- fmt.Sprintf("%s:%s", pk, addr)
-		}
-	} else if cfg.privKey != "" {
-		if len(cfg.privKey) != 64 {
-			log.Fatal("Private key must be large then 64")
-		}
+        // Tampilkan stats kecepatan setiap 5 detik
+        startSpeedStats(5)
 
-		for t := 0; t < cfg.threads; t++ {
-			wg.Add(1)
-			go checkBalance(chData, client)
-		}
+        if cfg.random {
+                for t := 0; t < cfg.threads; t++ {
+                        wg.Add(1)
+                        go checkBalance(chData, client)
+                }
 
-		pk := cfg.privKey
-		for {
-			pk = generateNextPrivKey(pk)
-			addr := generateAddressFromPrivKey(pk)
-			chData <- fmt.Sprintf("%s:%s", pk, addr)
-		}
-	} else if cfg.brain != "" {
-		passList, err := getPasswordList(cfg.brain)
-		if err != nil {
-			log.Fatal(err)
-		}
+                for {
+                        pk := generateRandomPrivKey()
+                        addr := generateAddressFromPrivKey(pk)
+                        chData <- fmt.Sprintf("%s:%s", pk, addr)
+                }
+        } else if cfg.privKey != "" {
+                if len(cfg.privKey) != 64 {
+                        log.Fatal("Private key must be large then 64")
+                }
 
-		for i := 0; i < int(cfg.threads); i++ {
-			wg.Add(1)
-			go checkBrainBalance(chData, client)
-		}
+                for t := 0; t < cfg.threads; t++ {
+                        wg.Add(1)
+                        go checkBalance(chData, client)
+                }
 
-		for _, password := range passList {
-			chData <- password
-		}
-		close(chData)
-		wg.Wait()
-	} else {
-		usage()
-	}
+                pk := cfg.privKey
+                for {
+                        pk = generateNextPrivKey(pk)
+                        addr := generateAddressFromPrivKey(pk)
+                        chData <- fmt.Sprintf("%s:%s", pk, addr)
+                }
+        } else if cfg.brain != "" {
+                passList, err := getPasswordList(cfg.brain)
+                if err != nil {
+                        log.Fatal(err)
+                }
+
+                for i := 0; i < int(cfg.threads); i++ {
+                        wg.Add(1)
+                        go checkBrainBalance(chData, client)
+                }
+
+                for _, password := range passList {
+                        chData <- password
+                }
+                close(chData)
+                wg.Wait()
+        } else {
+                usage()
+        }
 }
