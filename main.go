@@ -74,12 +74,28 @@ func parseConfig() *config {
 }
 
 // ============================================================
-// RPC POOL — round-robin otomatis + failover
+// RPC POOL — round-robin otomatis + failover + health check + auto-reconnect
 // ============================================================
 
 type clientEntry struct {
-        client *ethclient.Client
-        url    string
+        client  *ethclient.Client
+        url     string
+        healthy int32      // atomic: 1 = sehat, 0 = tidak sehat
+        mu      sync.Mutex // untuk reconnect thread-safe
+}
+
+// reconnect melakukan dial ulang ke RPC server
+func (e *clientEntry) reconnect() {
+        e.mu.Lock()
+        defer e.mu.Unlock()
+        c, err := ethclient.Dial(e.url)
+        if err != nil {
+                log.Printf("[RECONNECT] Gagal reconnect ke %s: %v\n", e.url, err)
+                return
+        }
+        e.client = c
+        atomic.StoreInt32(&e.healthy, 1)
+        log.Printf("[RECONNECT] Berhasil reconnect ke %s\n", e.url)
 }
 
 type rpcPool struct {
@@ -94,7 +110,7 @@ func newRPCPool(primaryURL string, backupURLs []string) (*rpcPool, error) {
         if err != nil {
                 return nil, fmt.Errorf("gagal sambung ke server utama %s: %w", primaryURL, err)
         }
-        pool.clients = append(pool.clients, clientEntry{client: c, url: primaryURL})
+        pool.clients = append(pool.clients, clientEntry{client: c, url: primaryURL, healthy: 1})
         fmt.Printf("[RPC] Server utama  : %s\n", primaryURL)
 
         for _, url := range backupURLs {
@@ -107,23 +123,71 @@ func newRPCPool(primaryURL string, backupURLs []string) (*rpcPool, error) {
                         fmt.Printf("[RPC] Backup gagal  : %s (%v) — dilewati\n", url, err)
                         continue
                 }
-                pool.clients = append(pool.clients, clientEntry{client: bc, url: url})
+                pool.clients = append(pool.clients, clientEntry{client: bc, url: url, healthy: 1})
                 fmt.Printf("[RPC] Backup aktif  : %s\n", url)
         }
 
         fmt.Printf("[RPC] Total server  : %d\n", len(pool.clients))
+        pool.startHealthCheck(10) // cek kesehatan setiap 10 detik
         return pool, nil
 }
 
-// getClient round-robin: setiap request dikirim ke server berbeda secara bergilir
+// startHealthCheck menjalankan goroutine yang ping tiap RPC secara berkala.
+// Jika server mati → tandai tidak sehat + reconnect otomatis.
+// Jika server hidup kembali → tandai sehat kembali.
+func (p *rpcPool) startHealthCheck(intervalSec int) {
+        go func() {
+                ticker := time.NewTicker(time.Duration(intervalSec) * time.Second)
+                for range ticker.C {
+                        for i := range p.clients {
+                                e := &p.clients[i]
+                                ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+                                _, err := e.client.ChainID(ctx)
+                                cancel()
+
+                                if err != nil {
+                                        // Server tidak merespons
+                                        if atomic.CompareAndSwapInt32(&e.healthy, 1, 0) {
+                                                log.Printf("[HEALTH] Server DOWN: %s — mencoba reconnect...\n", e.url)
+                                        }
+                                        go e.reconnect()
+                                } else {
+                                        // Server sehat
+                                        if atomic.CompareAndSwapInt32(&e.healthy, 0, 1) {
+                                                log.Printf("[HEALTH] Server UP lagi: %s\n", e.url)
+                                        }
+                                }
+                        }
+                }
+        }()
+}
+
+// getClient round-robin: utamakan server yang sehat
 func (p *rpcPool) getClient() (*ethclient.Client, uint64) {
-        idx := atomic.AddUint64(&p.rrCounter, 1) % uint64(len(p.clients))
-        return p.clients[idx].client, idx
+        n := uint64(len(p.clients))
+        start := atomic.AddUint64(&p.rrCounter, 1) % n
+        // Cari server sehat mulai dari start
+        for i := uint64(0); i < n; i++ {
+                idx := (start + i) % n
+                if atomic.LoadInt32(&p.clients[idx].healthy) == 1 {
+                        return p.clients[idx].client, idx
+                }
+        }
+        // Fallback: semua tidak sehat, pakai round-robin biasa
+        return p.clients[start].client, start
 }
 
 // nextClient ambil server berikutnya setelah error (skip server yang gagal)
 func (p *rpcPool) nextClient(failedIdx uint64) *ethclient.Client {
-        idx := (failedIdx + 1) % uint64(len(p.clients))
+        n := uint64(len(p.clients))
+        for i := uint64(1); i < n; i++ {
+                idx := (failedIdx + i) % n
+                if atomic.LoadInt32(&p.clients[idx].healthy) == 1 {
+                        return p.clients[idx].client
+                }
+        }
+        // Fallback
+        idx := (failedIdx + 1) % n
         return p.clients[idx].client
 }
 
@@ -319,6 +383,10 @@ func checkBalance(data chan string, pool *rpcPool, timeoutSec int) {
 
                         if err != nil {
                                 attempt++
+                                // Setelah 3 error berturut-turut, picu reconnect segera (tidak tunggu health check)
+                                if attempt%3 == 0 {
+                                        go pool.clients[idx].reconnect()
+                                }
                                 // Backoff: 500ms, 1s, 2s, 4s, 8s, cap 10s
                                 shift := attempt
                                 if shift > 5 {
