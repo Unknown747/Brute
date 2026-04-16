@@ -3,11 +3,8 @@ package main
 import (
         "context"
         "crypto/ecdsa"
-        "crypto/sha256"
-        "encoding/hex"
         "flag"
         "fmt"
-        "hash"
         "io"
         "log"
         "math/big"
@@ -28,16 +25,16 @@ import (
 )
 
 type config struct {
-        privKey string
         threads int
-        random  bool
+        mode1   bool
+        mode2   bool
         server  string
         port    int
-        brain   string
 }
 
 const (
-        POSSIBLE = "0123456789abcdef"
+        POSSIBLE    = "0123456789abcdef"
+        LAST_KEY_FILE = "last_key.txt"
 )
 
 var (
@@ -46,55 +43,59 @@ var (
         wg        sync.WaitGroup
         usage     = func() {
                 fmt.Fprintf(os.Stderr, "Usage of %s:\n", os.Args[0])
+                fmt.Fprintf(os.Stderr, "  Mode random  : ./eth-brute -threads 50 -mode1\n")
+                fmt.Fprintf(os.Stderr, "  Mode berurutan: ./eth-brute -threads 50 -mode2\n\n")
                 flag.PrintDefaults()
         }
 
         randMu  sync.Mutex
         globalR = rand.New(rand.NewSource(time.Now().UnixNano()))
+
+        lastKeyMu sync.Mutex
 )
 
 func parseConfig() *config {
         var cfg config
 
-        flag.StringVar(&cfg.privKey, "pk", "", "Start private key")
-        flag.IntVar(&cfg.threads, "threads", runtime.NumCPU(), "Number of threads")
-        flag.BoolVar(&cfg.random, "random", false, "Generate random private key")
+        flag.IntVar(&cfg.threads, "threads", runtime.NumCPU(), "Jumlah thread")
+        flag.BoolVar(&cfg.mode1, "mode1", false, "Mode random: generate private key acak")
+        flag.BoolVar(&cfg.mode2, "mode2", false, "Mode berurutan: lanjut dari last_key.txt")
         flag.StringVar(&cfg.server, "server", "202.61.239.89", "Ethereum rpc server")
         flag.IntVar(&cfg.port, "port", 8545, "Ethereum rpc port")
-        flag.StringVar(&cfg.brain, "brain", "", "Password list")
         flag.Parse()
 
         return &cfg
 }
 
-func getPasswordList(path string) ([]string, error) {
-        f, err := os.ReadFile(path)
+// Baca private key terakhir dari last_key.txt
+// Jika file tidak ada, mulai dari key default
+func readLastKey() string {
+        data, err := os.ReadFile(LAST_KEY_FILE)
         if err != nil {
-                return nil, err
+                defaultKey := "0000000000000000000000000000000000000000000000000000000000000001"
+                writeLastKey(defaultKey)
+                return defaultKey
         }
-
-        passwords := strings.Split(string(f), "\n")
-        return passwords, nil
+        key := strings.TrimSpace(string(data))
+        if len(key) != 64 {
+                log.Fatalf("last_key.txt berisi key tidak valid (harus 64 karakter hex)\n")
+        }
+        return key
 }
 
-func SHA256(hasher hash.Hash, input []byte) (hash []byte) {
-        hasher.Reset()
-        hasher.Write(input)
-        hash = hasher.Sum(nil)
-        return hash
+// Simpan private key terbaru ke last_key.txt
+func writeLastKey(key string) {
+        lastKeyMu.Lock()
+        defer lastKeyMu.Unlock()
+        err := os.WriteFile(LAST_KEY_FILE, []byte(key), 0644)
+        if err != nil {
+                log.Printf("Gagal menyimpan last_key.txt: %v\n", err)
+        }
 }
 
-func NewPrivateKey(password string) string {
-        hasher := sha256.New()
-        sha := SHA256(hasher, []byte(password))
-        priv := hex.EncodeToString(sha)
-        return priv
-}
-
-func generateNextPrivKey(hex string) string {
-        sh := strings.Split(hex, "")
-
-        for i := len(hex) - 1; i >= 0; i-- {
+func generateNextPrivKey(privHex string) string {
+        sh := strings.Split(privHex, "")
+        for i := len(privHex) - 1; i >= 0; i-- {
                 point := strings.Index(POSSIBLE, sh[i])
                 if point == 15 {
                         sh[i] = "0"
@@ -106,11 +107,9 @@ func generateNextPrivKey(hex string) string {
         return strings.Join(sh, "")
 }
 
-// PERBAIKAN #5: Menggunakan globalR dengan mutex, tidak membuat rand baru setiap panggilan
 func generateRandomPrivKey() string {
         randMu.Lock()
         defer randMu.Unlock()
-
         var randHex string
         for c := 0; c < 64; c++ {
                 n := globalR.Intn(16)
@@ -131,75 +130,30 @@ func balanceAt(client *ethclient.Client, address string) (*big.Int, error) {
         return balance, nil
 }
 
-// PERBAIKAN #1 & #3: Gunakan range agar goroutine berhenti saat channel ditutup
-// Tambah backoff 500ms saat error agar tidak spam ke server
-func checkBrainBalance(passwords chan string, client *ethclient.Client) {
-        // PERBAIKAN #2: defer wg.Done() di awal fungsi, bukan di dalam loop
-        defer wg.Done()
-
-        for password := range passwords {
-                privKey := NewPrivateKey(password)
-                address := generateAddressFromPrivKey(privKey)
-                creds := fmt.Sprintf("%s:%s", privKey, address)
-
-                balance, err := balanceAt(client, address)
-
-                if err != nil {
-                        log.Printf("Check balance: %s %v\n", creds, err)
-                        time.Sleep(500 * time.Millisecond)
-                        continue
-                }
-
-                if balance.Cmp(big.NewInt(0)) != 0 {
-                        data := password + ":" + creds + ":" + balance.String() + "\n"
-                        writeToFound(data, "found.txt")
-                }
-                atomic.AddUint64(&counter, 1)
-                fmt.Printf("Creds: %s Balance: %s Counter: %d\n", password+":"+creds, balance.String(), atomic.LoadUint64(&counter))
-        }
-}
-
-func generateAddressFromPrivKey(hex string) string {
-        privateKey, err := crypto.HexToECDSA(hex)
+func generateAddressFromPrivKey(privHex string) string {
+        privateKey, err := crypto.HexToECDSA(privHex)
         if err != nil {
                 log.Fatal(err)
         }
-
         publicKey := privateKey.Public()
         publicKeyECDSA, ok := publicKey.(*ecdsa.PublicKey)
         if !ok {
                 log.Fatal("cannot assert type: publicKey is not of type *ecdsa.PublicKey")
         }
-
-        address := crypto.PubkeyToAddress(*publicKeyECDSA).Hex()
-        return address
+        return crypto.PubkeyToAddress(*publicKeyECDSA).Hex()
 }
 
-/*
-Reserved:
-http://47.57.116.69:8545
-http://15.235.3.192:8545
-http://138.197.226.208:8545
-http://138.68.18.195:8545
-http://118.190.150.141:8545
-http://134.209.168.70:8545
-http://206.189.132.206:8545
-http://159.65.9.192:8545
-http://139.59.117.46:8545
-http://165.227.16.243:8545
-202.61.239.89:8545 NEW!
-*/
-
-// PERBAIKAN #1 & #3: Gunakan range agar goroutine berhenti saat channel ditutup
-// Tambah backoff 500ms saat error
 func checkBalance(data chan string, client *ethclient.Client) {
         defer wg.Done()
 
         for creds := range data {
-                addr := strings.Split(creds, ":")[1]
+                parts := strings.SplitN(creds, ":", 2)
+                if len(parts) < 2 {
+                        continue
+                }
+                addr := parts[1]
 
                 balance, err := balanceAt(client, addr)
-
                 if err != nil {
                         if err == io.EOF {
                                 log.Fatalf("Check balance: %s %v\n", creds, err)
@@ -224,7 +178,6 @@ func writeToFound(text string, path string) {
                 log.Fatalf("Open file: %s %v\n", text, err)
         }
         defer f.Close()
-
         _, err = f.WriteString(text)
         if err != nil {
                 log.Fatalf("Write string: %s %v\n", text, err)
@@ -242,12 +195,11 @@ func writeStatsLog(line string) {
         f.WriteString(line + "\n")
 }
 
-// startSpeedStats mencetak stats kecepatan setiap interval detik dan menyimpan ke stats.log
+// startSpeedStats mencetak stats kecepatan setiap 1 menit dan menyimpan ke stats.log
 func startSpeedStats(intervalSec int) {
         ticker := time.NewTicker(time.Duration(intervalSec) * time.Second)
         var lastCount uint64 = 0
 
-        // Tulis header sesi baru ke stats.log
         sessionStart := fmt.Sprintf("\n=== Sesi dimulai: %s ===", startTime.Format("2006-01-02 15:04:05"))
         writeStatsLog(sessionStart)
 
@@ -285,6 +237,16 @@ func cleanup() {
 func main() {
         cfg := parseConfig()
 
+        if !cfg.mode1 && !cfg.mode2 {
+                usage()
+                os.Exit(1)
+        }
+
+        if cfg.mode1 && cfg.mode2 {
+                fmt.Fprintln(os.Stderr, "Pilih salah satu: -mode1 atau -mode2")
+                os.Exit(1)
+        }
+
         client, err := ethclient.Dial("http://" + cfg.server + ":" + strconv.Itoa(cfg.port))
         if err != nil {
                 log.Fatalf("Client: %s\n", err)
@@ -293,7 +255,6 @@ func main() {
 
         startTime = time.Now()
 
-        // Buffered channel sebesar 2x jumlah threads
         chData := make(chan string, cfg.threads*2)
         chExit := make(chan os.Signal, 1)
 
@@ -305,53 +266,38 @@ func main() {
                 os.Exit(0)
         }()
 
-        // Tampilkan stats kecepatan setiap 1 menit
         startSpeedStats(60)
 
-        if cfg.random {
+        if cfg.mode1 {
+                // Mode random
+                fmt.Printf("[MODE1] Random | Threads: %d | Server: %s:%d\n", cfg.threads, cfg.server, cfg.port)
                 for t := 0; t < cfg.threads; t++ {
                         wg.Add(1)
                         go checkBalance(chData, client)
                 }
-
                 for {
                         pk := generateRandomPrivKey()
                         addr := generateAddressFromPrivKey(pk)
                         chData <- fmt.Sprintf("%s:%s", pk, addr)
                 }
-        } else if cfg.privKey != "" {
-                if len(cfg.privKey) != 64 {
-                        log.Fatal("Private key must be large then 64")
-                }
+
+        } else if cfg.mode2 {
+                // Mode berurutan — lanjut dari last_key.txt, auto update setiap key baru
+                pk := readLastKey()
+                fmt.Printf("[MODE2] Berurutan | Mulai dari: %s | Threads: %d | Server: %s:%d\n",
+                        pk, cfg.threads, cfg.server, cfg.port)
 
                 for t := 0; t < cfg.threads; t++ {
                         wg.Add(1)
                         go checkBalance(chData, client)
                 }
-
-                pk := cfg.privKey
                 for {
                         pk = generateNextPrivKey(pk)
                         addr := generateAddressFromPrivKey(pk)
                         chData <- fmt.Sprintf("%s:%s", pk, addr)
+                        // Simpan progress setiap key baru ke last_key.txt
+                        go writeLastKey(pk)
                 }
-        } else if cfg.brain != "" {
-                passList, err := getPasswordList(cfg.brain)
-                if err != nil {
-                        log.Fatal(err)
-                }
-
-                for i := 0; i < int(cfg.threads); i++ {
-                        wg.Add(1)
-                        go checkBrainBalance(chData, client)
-                }
-
-                for _, password := range passList {
-                        chData <- password
-                }
-                close(chData)
-                wg.Wait()
-        } else {
-                usage()
         }
 }
+
