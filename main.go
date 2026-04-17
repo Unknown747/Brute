@@ -1,8 +1,8 @@
 package main
 
 import (
-        "bytes"
         "bufio"
+        "bytes"
         "context"
         "crypto/ecdsa"
         crand "crypto/rand"
@@ -173,14 +173,21 @@ func sendTelegram(msg string) {
 // ============================================================
 
 type clientEntry struct {
-        eth     *ethclient.Client
-        raw     *rpc.Client
-        url     string
-        healthy int32
-        mu      sync.Mutex
+        eth          *ethclient.Client
+        raw          *rpc.Client
+        url          string
+        healthy      int32
+        reconnecting int32 // 1 jika sedang reconnect, cegah goroutine ganda
+        mu           sync.Mutex
 }
 
 func (e *clientEntry) reconnect() {
+        // Jika sudah ada goroutine reconnect yang berjalan, jangan spawn lagi
+        if !atomic.CompareAndSwapInt32(&e.reconnecting, 0, 1) {
+                return
+        }
+        defer atomic.StoreInt32(&e.reconnecting, 0)
+
         e.mu.Lock()
         defer e.mu.Unlock()
         raw, err := rpc.Dial(e.url)
@@ -579,8 +586,11 @@ func checkBalance(ctx context.Context, data chan string, pool *rpcPool, timeoutS
                 }
                 addrs := make([]string, len(batch))
                 for i, cred := range batch {
-                        if parts := strings.SplitN(cred, ":", 2); len(parts) == 2 {
+                        if parts := strings.SplitN(cred, ":", 2); len(parts) == 2 && parts[1] != "" {
                                 addrs[i] = parts[1]
+                        } else {
+                                // Fallback: alamat kosong → selalu balance 0, tidak membahayakan
+                                addrs[i] = "0x0000000000000000000000000000000000000000"
                         }
                 }
 
@@ -704,9 +714,11 @@ func closeFoundFile() {
         defer foundMu.Unlock()
         if foundWriter != nil {
                 _ = foundWriter.Flush()
+                foundWriter = nil
         }
         if foundFile != nil {
                 _ = foundFile.Close()
+                foundFile = nil
         }
 }
 
@@ -739,9 +751,11 @@ func closeStatsFile() {
         defer statsMu.Unlock()
         if statsWriter != nil {
                 _ = statsWriter.Flush()
+                statsWriter = nil
         }
         if statsFile != nil {
                 _ = statsFile.Close()
+                statsFile = nil
         }
 }
 
