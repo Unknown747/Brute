@@ -2,8 +2,11 @@ package main
 
 import (
         "bytes"
+        "bufio"
         "context"
         "crypto/ecdsa"
+        crand "crypto/rand"
+        "encoding/binary"
         "encoding/json"
         "flag"
         "fmt"
@@ -104,8 +107,11 @@ var (
         lastKeyMu sync.Mutex
         lastKeyCh = make(chan string, 1)
 
-        foundMu sync.Mutex
-        tgCfg   *telegramConfig
+        foundMu     sync.Mutex
+        foundWriter *bufio.Writer
+        foundFile   *os.File
+
+        tgCfg *telegramConfig
 )
 
 // ============================================================
@@ -377,14 +383,21 @@ func startKeyWriter() {
 }
 
 func sendLastKey(key string) {
+        // Selalu non-blocking: coba kirim langsung; jika channel penuh,
+        // drain dulu lalu coba kirim lagi — semua cabang tidak pernah blocking.
         select {
         case lastKeyCh <- key:
         default:
+                // Kosongkan slot yang sudah ada (key lama)
                 select {
                 case <-lastKeyCh:
                 default:
                 }
-                lastKeyCh <- key
+                // Kirim key baru; jika slot sudah diambil writer, pakai default
+                select {
+                case lastKeyCh <- key:
+                default:
+                }
         }
 }
 
@@ -435,6 +448,18 @@ func generateNextPrivKey(privHex string) string {
                 return defaultKey
         }
         return string(b)
+}
+
+// cryptoRandSeed menghasilkan seed 64-bit yang benar-benar acak menggunakan
+// crypto/rand, sehingga setiap restart program tidak mengulang urutan yang sama.
+func cryptoRandSeed() int64 {
+        var buf [8]byte
+        if _, err := crand.Read(buf[:]); err != nil {
+                // Fallback ke waktu jika crypto/rand gagal (sangat jarang terjadi)
+                log.Printf("[WARN] crypto/rand gagal, pakai time seed: %v\n", err)
+                return time.Now().UnixNano()
+        }
+        return int64(binary.LittleEndian.Uint64(buf[:]))
 }
 
 func generateRandomPrivKey(r *rand.Rand) string {
@@ -636,18 +661,41 @@ func checkBalance(ctx context.Context, data chan string, pool *rpcPool, timeoutS
 // OUTPUT & STATS
 // ============================================================
 
+// openFoundFile membuka found.txt sekali di awal program.
+// Menggunakan bufio.Writer agar tidak ada syscall open/close tiap baris.
+func openFoundFile() {
+        f, err := os.OpenFile("found.txt", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+        if err != nil {
+                log.Fatalf("Gagal buka found.txt: %v\n", err)
+        }
+        foundFile = f
+        foundWriter = bufio.NewWriter(f)
+}
+
+// closeFoundFile flush buffer dan tutup file saat shutdown.
+func closeFoundFile() {
+        foundMu.Lock()
+        defer foundMu.Unlock()
+        if foundWriter != nil {
+                _ = foundWriter.Flush()
+        }
+        if foundFile != nil {
+                _ = foundFile.Close()
+        }
+}
+
 func writeToFound(text string) {
         foundMu.Lock()
         defer foundMu.Unlock()
-        f, err := os.OpenFile("found.txt", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-        if err != nil {
-                log.Printf("Gagal buka found.txt: %v\n", err)
+        if foundWriter == nil {
                 return
         }
-        defer f.Close()
-        if _, err = f.WriteString(text); err != nil {
+        if _, err := foundWriter.WriteString(text); err != nil {
                 log.Printf("Gagal tulis found.txt: %v\n", err)
+                return
         }
+        // Langsung flush agar data tidak hilang jika program tiba-tiba berhenti
+        _ = foundWriter.Flush()
 }
 
 func writeStatsLog(line string) {
@@ -686,6 +734,7 @@ func cleanup() {
                 total, elapsed.Round(time.Second), avg)
         fmt.Printf("\n%s\n", line)
         writeStatsLog(line)
+        closeFoundFile()
 }
 
 // ============================================================
@@ -708,6 +757,8 @@ func main() {
         if silent {
                 fmt.Println("[SILENT] Mode diam — hanya tampil [STATS] dan [FOUND]")
         }
+
+        openFoundFile()
 
         tgCfg = loadTelegramConfig("telegram.json")
 
@@ -752,9 +803,9 @@ func main() {
                 var prodWg sync.WaitGroup
                 for p := 0; p < cfg.producers; p++ {
                         prodWg.Add(1)
-                        go func(seed int64) {
+                        go func() {
                                 defer prodWg.Done()
-                                r := rand.New(rand.NewSource(seed))
+                                r := rand.New(rand.NewSource(cryptoRandSeed()))
                                 for {
                                         pk := generateRandomPrivKey(r)
                                         addr, err := generateAddressFromPrivKey(pk)
@@ -768,7 +819,7 @@ func main() {
                                                 return
                                         }
                                 }
-                        }(time.Now().UnixNano() + int64(p)*999983)
+                        }()
                 }
                 prodWg.Wait()
 
