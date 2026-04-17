@@ -1,0 +1,29 @@
+modules = ["go-1.21"]
+[agent]
+expertMode = true
+
+[nix]
+channel = "stable-25_05"
+
+[workflows]
+runButton = "Project"
+
+[[workflows.workflow]]
+name = "Project"
+mode = "parallel"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "Build eth-brute"
+
+[[workflows.workflow]]
+name = "Build eth-brute"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "go build -o eth-brute . && echo '[BUILD] eth-brute compiled successfully'"
+
+[workflows.workflow.metadata]
+outputType = "console"

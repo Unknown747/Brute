@@ -418,14 +418,21 @@ func startBackupRoutine(intervalMenit int) {
 
 func generateNextPrivKey(privHex string) string {
         b := []byte(privHex)
+        incremented := false
         for i := len(b) - 1; i >= 0; i-- {
                 pos := strings.IndexByte(POSSIBLE, b[i])
                 if pos == 15 {
                         b[i] = '0'
                 } else {
                         b[i] = POSSIBLE[pos+1]
+                        incremented = true
                         break
                 }
+        }
+        // If every digit was 'f', the key wrapped to all-zeros which is an invalid
+        // secp256k1 private key — reset to the first valid key instead.
+        if !incremented {
+                return defaultKey
         }
         return string(b)
 }
@@ -438,16 +445,16 @@ func generateRandomPrivKey(r *rand.Rand) string {
         return string(b)
 }
 
-func generateAddressFromPrivKey(privHex string) string {
+func generateAddressFromPrivKey(privHex string) (string, error) {
         privateKey, err := crypto.HexToECDSA(privHex)
         if err != nil {
-                log.Fatal(err)
+                return "", fmt.Errorf("HexToECDSA(%s): %w", privHex, err)
         }
         pubKey, ok := privateKey.Public().(*ecdsa.PublicKey)
         if !ok {
-                log.Fatal("publicKey bukan *ecdsa.PublicKey")
+                return "", fmt.Errorf("publicKey bukan *ecdsa.PublicKey untuk key %s", privHex)
         }
-        return crypto.PubkeyToAddress(*pubKey).Hex()
+        return crypto.PubkeyToAddress(*pubKey).Hex(), nil
 }
 
 // ============================================================
@@ -750,8 +757,13 @@ func main() {
                                 r := rand.New(rand.NewSource(seed))
                                 for {
                                         pk := generateRandomPrivKey(r)
+                                        addr, err := generateAddressFromPrivKey(pk)
+                                        if err != nil {
+                                                log.Printf("[SKIP] key tidak valid, dilewati: %v\n", err)
+                                                continue
+                                        }
                                         select {
-                                        case chData <- pk + ":" + generateAddressFromPrivKey(pk):
+                                        case chData <- pk + ":" + addr:
                                         case <-ctx.Done():
                                                 return
                                         }
@@ -774,8 +786,13 @@ func main() {
         outer:
                 for {
                         pk = generateNextPrivKey(pk)
+                        addr, err := generateAddressFromPrivKey(pk)
+                        if err != nil {
+                                log.Printf("[SKIP] key tidak valid, dilewati: %v\n", err)
+                                continue
+                        }
                         select {
-                        case chData <- pk + ":" + generateAddressFromPrivKey(pk):
+                        case chData <- pk + ":" + addr:
                                 sendLastKey(pk)
                         case <-ctx.Done():
                                 break outer
