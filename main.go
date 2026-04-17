@@ -150,6 +150,10 @@ func loadTelegramConfig(path string) *telegramConfig {
         return &cfg
 }
 
+// tgHTTPClient dipakai eksklusif untuk notifikasi Telegram agar tidak
+// memblokir program jika API Telegram lambat atau tidak merespons.
+var tgHTTPClient = &http.Client{Timeout: 10 * time.Second}
+
 func sendTelegram(msg string) {
         if tgCfg == nil {
                 return
@@ -160,7 +164,7 @@ func sendTelegram(msg string) {
                         "chat_id": tgCfg.ChatID,
                         "text":    msg,
                 })
-                resp, err := http.Post(url, "application/json", bytes.NewReader(body))
+                resp, err := tgHTTPClient.Post(url, "application/json", bytes.NewReader(body))
                 if err != nil {
                         log.Printf("[TELEGRAM] Gagal kirim: %v\n", err)
                         return
@@ -324,15 +328,16 @@ func (p *rpcPool) getEntry() (*clientEntry, uint64) {
         return &p.clients[start], start
 }
 
-func (p *rpcPool) nextEntry(failedIdx uint64) *clientEntry {
+func (p *rpcPool) nextEntry(failedIdx uint64) (*clientEntry, uint64) {
         n := uint64(len(p.clients))
         for i := uint64(1); i < n; i++ {
                 idx := (failedIdx + i) % n
                 if atomic.LoadInt32(&p.clients[idx].healthy) == 1 {
-                        return &p.clients[idx]
+                        return &p.clients[idx], idx
                 }
         }
-        return &p.clients[(failedIdx+1)%n]
+        fallback := (failedIdx + 1) % n
+        return &p.clients[fallback], fallback
 }
 
 // batchGetBalances mengirim N address dalam SATU HTTP request ke RPC
@@ -355,10 +360,14 @@ func (p *rpcPool) batchGetBalances(ctx context.Context, addrs []string, timeoutS
         cancel() // segera bebaskan context setelah selesai
 
         if err != nil && len(p.clients) > 1 {
-                other := p.nextEntry(idx)
+                other, otherIdx := p.nextEntry(idx)
                 callCtx2, cancel2 := context.WithTimeout(ctx, time.Duration(timeoutSec)*time.Second)
                 err = other.raw.BatchCallContext(callCtx2, elems)
                 cancel2() // segera bebaskan context setelah selesai
+                if err != nil {
+                        // kembalikan idx server failover agar caller mereconnect yang benar
+                        idx = otherIdx
+                }
         }
 
         if err != nil {
@@ -557,9 +566,12 @@ func generateAddressFromPrivKey(privHex string) (string, error) {
 // ============================================================
 
 type adaptiveBatch struct {
-        size     int64
-        attempts uint64
-        success  uint64
+        size int64
+        // wAttempts dan wSuccess melacak JENDELA saat ini saja.
+        // Setiap batchAdjEvery attempt, window di-reset sehingga rate
+        // mencerminkan kondisi RPC terkini — bukan riwayat seumur hidup.
+        wAttempts uint64
+        wSuccess  uint64
 }
 
 func newAdaptiveBatch(initial int) *adaptiveBatch {
@@ -577,18 +589,25 @@ func (a *adaptiveBatch) get() int {
 }
 
 func (a *adaptiveBatch) record(ok bool) {
-        atomic.AddUint64(&a.attempts, 1)
+        wAtt := atomic.AddUint64(&a.wAttempts, 1)
         if ok {
-                atomic.AddUint64(&a.success, 1)
+                atomic.AddUint64(&a.wSuccess, 1)
         }
-        total := atomic.LoadUint64(&a.attempts)
-        if total%batchAdjEvery != 0 {
+        // Hanya goroutine yang mendaratkan tepat kelipatan batchAdjEvery yang
+        // melakukan evaluasi; yang lain langsung kembali.
+        if wAtt%batchAdjEvery != 0 {
                 return
         }
-        succ := atomic.LoadUint64(&a.success)
-        rate := float64(succ) / float64(total)
-        cur := atomic.LoadInt64(&a.size)
+        wSucc := atomic.LoadUint64(&a.wSuccess)
+        rate := float64(wSucc) / float64(wAtt)
 
+        // Reset window SEBELUM adjust agar batch baru mulai dari slate bersih.
+        // Sedikit data yang masuk di antara AddUint64 dan StoreUint64 ini
+        // akan tercatat ke window berikutnya — tidak masalah untuk metrik adaptif.
+        atomic.StoreUint64(&a.wAttempts, 0)
+        atomic.StoreUint64(&a.wSuccess, 0)
+
+        cur := atomic.LoadInt64(&a.size)
         if rate > 0.90 {
                 next := cur + 5
                 if next > batchMax {
