@@ -184,6 +184,7 @@ type clientEntry struct {
         eth          *ethclient.Client
         raw          *rpc.Client
         url          string
+        httpClient   *http.Client // transport kustom yang dipakai saat dial pertama
         healthy      int32
         reconnecting int32 // 1 jika sedang reconnect, cegah goroutine ganda
         mu           sync.Mutex
@@ -198,7 +199,9 @@ func (e *clientEntry) reconnect() {
 
         e.mu.Lock()
         defer e.mu.Unlock()
-        raw, err := rpc.Dial(e.url)
+        // Gunakan dialRPC + httpClient yang sama dengan dial awal agar
+        // reconnect ke HTTP node tetap memakai transport yang dioptimasi.
+        raw, err := dialRPC(e.url, e.httpClient)
         if err != nil {
                 log.Printf("[RECONNECT] Gagal ke %s: %v\n", e.url, err)
                 return
@@ -248,7 +251,7 @@ func newRPCPool(primary string, backups []string, threads int) (*rpcPool, error)
                 return nil, fmt.Errorf("gagal sambung ke server utama %s: %w", primary, err)
         }
         pool.clients = append(pool.clients, clientEntry{
-                eth: ethclient.NewClient(raw), raw: raw, url: primary, healthy: 1,
+                eth: ethclient.NewClient(raw), raw: raw, url: primary, httpClient: httpClient, healthy: 1,
         })
         fmt.Printf("[RPC] Server utama : %s\n", primary)
 
@@ -263,7 +266,7 @@ func newRPCPool(primary string, backups []string, threads int) (*rpcPool, error)
                         continue
                 }
                 pool.clients = append(pool.clients, clientEntry{
-                        eth: ethclient.NewClient(r), raw: r, url: u, healthy: 1,
+                        eth: ethclient.NewClient(r), raw: r, url: u, httpClient: httpClient, healthy: 1,
                 })
                 fmt.Printf("[RPC] Backup aktif : %s\n", u)
         }
@@ -695,9 +698,11 @@ func checkBalance(ctx context.Context, data chan string, pool *rpcPool, timeoutS
                                         log.Printf("[RETRY] attempt=%d backoff=%s err=%v\n", attempt, backoff, err)
                                 }
 
+                                bt := time.NewTimer(backoff)
                                 select {
-                                case <-time.After(backoff):
+                                case <-bt.C:
                                 case <-ctx.Done():
+                                        bt.Stop()
                                         return false
                                 }
                                 continue
