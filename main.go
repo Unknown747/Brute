@@ -111,6 +111,10 @@ var (
         foundWriter *bufio.Writer
         foundFile   *os.File
 
+        statsMu     sync.Mutex
+        statsWriter *bufio.Writer
+        statsFile   *os.File
+
         tgCfg *telegramConfig
 )
 
@@ -224,7 +228,6 @@ func newRPCPool(primary string, backups []string) (*rpcPool, error) {
         }
 
         fmt.Printf("[RPC] Total server : %d\n", len(pool.clients))
-        pool.startHealthCheck(10)
         return pool, nil
 }
 
@@ -239,17 +242,22 @@ func isRateLimit(err error) bool {
                 strings.Contains(s, "rate_limited")
 }
 
-func (p *rpcPool) startHealthCheck(intervalSec int) {
+func (p *rpcPool) startHealthCheck(ctx context.Context, intervalSec int) {
         go func() {
                 ticker := time.NewTicker(time.Duration(intervalSec) * time.Second)
-                for range ticker.C {
+                defer ticker.Stop()
+                for {
+                        select {
+                        case <-ctx.Done():
+                                return
+                        case <-ticker.C:
+                        }
                         for i := range p.clients {
                                 e := &p.clients[i]
-                                ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-                                _, err := e.eth.ChainID(ctx)
+                                hCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+                                _, err := e.eth.ChainID(hCtx)
                                 cancel()
                                 if err != nil {
-                                        // Rate limit bukan berarti server mati — jangan reconnect
                                         if isRateLimit(err) {
                                                 continue
                                         }
@@ -415,12 +423,18 @@ func backupLastKey() {
         fmt.Printf("[BACKUP] last_key.bak → %s\n", strings.TrimSpace(string(data)))
 }
 
-func startBackupRoutine(intervalMenit int) {
+func startBackupRoutine(ctx context.Context, intervalMenit int) {
         fmt.Printf("[BACKUP] Backup otomatis setiap %d menit\n", intervalMenit)
         go func() {
                 ticker := time.NewTicker(time.Duration(intervalMenit) * time.Minute)
-                for range ticker.C {
-                        backupLastKey()
+                defer ticker.Stop()
+                for {
+                        select {
+                        case <-ctx.Done():
+                                return
+                        case <-ticker.C:
+                                backupLastKey()
+                        }
                 }
         }()
 }
@@ -542,7 +556,11 @@ func (a *adaptiveBatch) record(ok bool) {
 // BALANCE CHECK
 // ============================================================
 
-func checkBalance(ctx context.Context, data chan string, pool *rpcPool, timeoutSec int, ab *adaptiveBatch) {
+// onChecked dipanggil setelah satu batch berhasil dicek; argumennya adalah
+// private key TERAKHIR dalam batch. Di mode2 ini dipakai untuk menyimpan
+// progress ke last_key.txt SETELAH kunci benar-benar diperiksa — bukan
+// hanya setelah masuk channel buffer.
+func checkBalance(ctx context.Context, data chan string, pool *rpcPool, timeoutSec int, ab *adaptiveBatch, onChecked func(string)) {
         defer wg.Done()
 
         const (
@@ -625,6 +643,14 @@ func checkBalance(ctx context.Context, data chan string, pool *rpcPool, timeoutS
                                         }
                                 }
                         }
+                        // Setelah batch berhasil dicek, beritahu caller (mode2)
+                        // key terakhir yang sudah dikonfirmasi diperiksa.
+                        if onChecked != nil && len(batch) > 0 {
+                                lastCred := batch[len(batch)-1]
+                                if parts := strings.SplitN(lastCred, ":", 2); len(parts) == 2 {
+                                        onChecked(parts[0])
+                                }
+                        }
                         break
                 }
                 batch = batch[:0]
@@ -698,21 +724,49 @@ func writeToFound(text string) {
         _ = foundWriter.Flush()
 }
 
-func writeStatsLog(line string) {
+func openStatsFile() {
         f, err := os.OpenFile("stats.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
         if err != nil {
+                log.Printf("[WARN] Gagal buka stats.log: %v\n", err)
                 return
         }
-        defer f.Close()
-        _, _ = f.WriteString(line + "\n")
+        statsFile = f
+        statsWriter = bufio.NewWriter(f)
 }
 
-func startSpeedStats(intervalSec int) {
+func closeStatsFile() {
+        statsMu.Lock()
+        defer statsMu.Unlock()
+        if statsWriter != nil {
+                _ = statsWriter.Flush()
+        }
+        if statsFile != nil {
+                _ = statsFile.Close()
+        }
+}
+
+func writeStatsLog(line string) {
+        statsMu.Lock()
+        defer statsMu.Unlock()
+        if statsWriter == nil {
+                return
+        }
+        _, _ = statsWriter.WriteString(line + "\n")
+        _ = statsWriter.Flush()
+}
+
+func startSpeedStats(ctx context.Context, intervalSec int) {
         writeStatsLog(fmt.Sprintf("\n=== Sesi dimulai: %s ===", startTime.Format("2006-01-02 15:04:05")))
         go func() {
                 ticker := time.NewTicker(time.Duration(intervalSec) * time.Second)
+                defer ticker.Stop()
                 var lastCount uint64
-                for range ticker.C {
+                for {
+                        select {
+                        case <-ctx.Done():
+                                return
+                        case <-ticker.C:
+                        }
                         current := atomic.LoadUint64(&counter)
                         elapsed := time.Since(startTime)
                         speed := float64(current-lastCount) / float64(intervalSec)
@@ -735,6 +789,7 @@ func cleanup() {
         fmt.Printf("\n%s\n", line)
         writeStatsLog(line)
         closeFoundFile()
+        closeStatsFile()
 }
 
 // ============================================================
@@ -759,6 +814,7 @@ func main() {
         }
 
         openFoundFile()
+        openStatsFile()
 
         tgCfg = loadTelegramConfig("telegram.json")
 
@@ -781,6 +837,8 @@ func main() {
         ctx, cancel := context.WithCancel(context.Background())
         defer cancel()
 
+        pool.startHealthCheck(ctx, 10)
+
         chExit := make(chan os.Signal, 1)
         signal.Notify(chExit, os.Interrupt, syscall.SIGTERM)
         go func() {
@@ -789,7 +847,7 @@ func main() {
                 cancel()
         }()
 
-        startSpeedStats(60)
+        startSpeedStats(ctx, 60)
 
         if cfg.mode1 {
                 fmt.Printf("[MODE1] Random | Checkers: %d | Producers: %d | Batch: %d | Timeout: %ds | Server: %d\n",
@@ -797,7 +855,7 @@ func main() {
 
                 for t := 0; t < cfg.threads; t++ {
                         wg.Add(1)
-                        go checkBalance(ctx, chData, pool, cfg.timeout, ab)
+                        go checkBalance(ctx, chData, pool, cfg.timeout, ab, nil)
                 }
 
                 var prodWg sync.WaitGroup
@@ -825,14 +883,18 @@ func main() {
 
         } else {
                 startKeyWriter()
-                startBackupRoutine(5)
+                startBackupRoutine(ctx, 5)
                 pk := readLastKey()
                 fmt.Printf("[MODE2] Berurutan | Mulai: %s | Checkers: %d | Batch: %d | Timeout: %ds | Server: %d\n",
                         pk, cfg.threads, ab.get(), cfg.timeout, len(pool.clients))
 
+                // onChecked: simpan progress SETELAH key benar-benar dicek,
+                // bukan hanya setelah masuk channel buffer.
                 for t := 0; t < cfg.threads; t++ {
                         wg.Add(1)
-                        go checkBalance(ctx, chData, pool, cfg.timeout, ab)
+                        go checkBalance(ctx, chData, pool, cfg.timeout, ab, func(checkedPK string) {
+                                sendLastKey(checkedPK)
+                        })
                 }
         outer:
                 for {
@@ -844,7 +906,6 @@ func main() {
                         }
                         select {
                         case chData <- pk + ":" + addr:
-                                sendLastKey(pk)
                         case <-ctx.Done():
                                 break outer
                         }
